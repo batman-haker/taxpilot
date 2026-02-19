@@ -21,6 +21,7 @@ import csv
 import hashlib
 import io
 import logging
+import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -219,7 +220,8 @@ class IBKRParser(BaseParser):
             else:
                 action = ActionType.BUY
 
-            trade_date_str = row.get("TradeDate", "")
+            # Prefer DateTime (has full timestamp) over TradeDate (date only)
+            trade_date_str = row.get("DateTime", row.get("TradeDate", ""))
             if not trade_date_str:
                 return None
             trade_dt = _parse_ibkr_datetime(trade_date_str)
@@ -278,13 +280,17 @@ class IBKRParser(BaseParser):
 
             pay_dt = _parse_ibkr_datetime(date_str)
 
+            isin_val = row.get("ISIN") or None
+            country = isin_val[:2].upper() if isin_val and len(isin_val) >= 2 and isin_val[:2].isalpha() else None
+
             if tx_type == "Dividends" and symbol:
                 row_id = _make_id(f"IBKR_DIV_{tx_id}_{symbol}")
                 results.append(UnifiedTransaction(
                     id=row_id,
                     broker=BrokerName.IBKR,
                     symbol=symbol,
-                    isin=None,
+                    isin=isin_val,
+                    country=country,
                     description=None,
                     trade_date=pay_dt,
                     settlement_date=pay_dt.date(),
@@ -301,7 +307,8 @@ class IBKRParser(BaseParser):
                     id=row_id,
                     broker=BrokerName.IBKR,
                     symbol=symbol,
-                    isin=None,
+                    isin=isin_val,
+                    country=country,
                     description=None,
                     trade_date=pay_dt,
                     settlement_date=pay_dt.date(),
@@ -324,26 +331,104 @@ class IBKRParser(BaseParser):
     # ------------------------------------------------------------------
 
     def _parse_csv_delimited(self, text: str, filename: str = "") -> list[UnifiedTransaction]:
-        """Parse comma-delimited IBKR CSV files with quoted values."""
+        """Parse comma-delimited IBKR CSV files – handles multi-section raw format.
+
+        Raw IBKR CSV files can contain multiple sections (Trades, Transfers,
+        Dividends) concatenated together, each with its own header row starting
+        with 'ClientAccountID'.  Data from one section may resume after another
+        section without a new header (e.g. 2025 trades appearing after a
+        Transfers block that followed 2024 trades).
+        """
         results: list[UnifiedTransaction] = []
 
-        reader = csv.DictReader(io.StringIO(text))
-        if not reader.fieldnames:
-            return results
+        reader = csv.reader(io.StringIO(text))
 
-        has_trade_price = "TradePrice" in reader.fieldnames
-        has_type_col = "Type" in reader.fieldnames
+        # Store all section headers encountered
+        section_headers: dict[str, list[str]] = {}  # section_type -> columns
+        current_section = ""
+        current_headers: list[str] = []
 
-        for row in reader:
-            if has_trade_price and not has_type_col:
-                tx = self._pipe_trade_to_transaction(row)
-                if tx:
-                    results.append(tx)
-            elif has_type_col:
-                txs = self._pipe_cash_to_transactions(row)
+        for parts in reader:
+            if not parts:
+                continue
+
+            parts = [p.strip() for p in parts]
+
+            # Detect header rows – all IBKR raw CSV headers start with ClientAccountID
+            if parts[0] == "ClientAccountID":
+                current_headers = parts
+                current_section = self._classify_raw_section(parts)
+                if current_section != "other":
+                    section_headers[current_section] = parts
+                continue
+
+            if not section_headers:
+                continue
+
+            # Try current section first
+            txs = self._try_parse_raw_row(parts, current_section, current_headers)
+            if txs:
                 results.extend(txs)
+                continue
+
+            # Fallback: try other known sections (handles section switches
+            # without a new header, e.g. trades resuming after transfers)
+            for sec_type, sec_headers in section_headers.items():
+                if sec_type == current_section:
+                    continue
+                txs = self._try_parse_raw_row(parts, sec_type, sec_headers)
+                if txs:
+                    results.extend(txs)
+                    # Update current section for subsequent rows
+                    current_section = sec_type
+                    current_headers = sec_headers
+                    break
 
         return results
+
+    @staticmethod
+    def _classify_raw_section(headers: list[str]) -> str:
+        """Classify a raw CSV header row by section type."""
+        header_set = set(headers)
+        if "Direction" in header_set and (
+            "TransferCompany" in header_set or "TransferAccount" in header_set
+        ):
+            return "transfers"
+        if "Buy/Sell" in header_set or "TradeID" in header_set:
+            return "trades"
+        if "ActionDescription" in header_set and (
+            "Type" in header_set or "Amount" in header_set
+        ):
+            return "dividends"
+        return "other"
+
+    def _try_parse_raw_row(
+        self, parts: list[str], section: str, headers: list[str]
+    ) -> list[UnifiedTransaction]:
+        """Try to parse a data row using the given section type and header."""
+        row = dict(zip(headers, parts))
+
+        if section == "trades":
+            buy_sell = row.get("Buy/Sell", "")
+            if buy_sell not in ("BUY", "SELL"):
+                return []
+            tx = self._pipe_trade_to_transaction(row)
+            return [tx] if tx else []
+
+        elif section == "transfers":
+            direction = row.get("Direction", "").strip().upper()
+            if direction not in ("IN", "OUT"):
+                return []
+            tx = self._flex_transfer_to_transaction(row)
+            return [tx] if tx else []
+
+        elif section == "dividends":
+            type_val = row.get("Type", "")
+            if type_val not in ("Dividends", "Withholding Tax"):
+                return []
+            return self._pipe_cash_to_transactions(row)
+
+        return []
 
     # ------------------------------------------------------------------
     # Flex Query CSV format (section-based, comma-separated)
@@ -353,12 +438,13 @@ class IBKRParser(BaseParser):
         """Parse Flex Query CSV format with Trades,Header / Trades,Data markers."""
         results: list[UnifiedTransaction] = []
 
-        lines = text.splitlines()
+        # Use csv.reader to handle quoted fields (e.g. "2023-10-05, 05:36:04" or "1,355")
+        reader = csv.reader(io.StringIO(text))
         header_cols: list[str] = []
         current_section = ""
 
-        for line in lines:
-            parts = [p.strip().strip('"') for p in line.split(",")]
+        for parts in reader:
+            parts = [p.strip() for p in parts]
             if len(parts) < 2:
                 continue
 
@@ -387,11 +473,19 @@ class IBKRParser(BaseParser):
                 tx = self._flex_div_to_transaction(row, ActionType.TAX_WHT)
                 if tx:
                     results.append(tx)
+            elif current_section == "Transfers":
+                tx = self._flex_transfer_to_transaction(row)
+                if tx:
+                    results.append(tx)
 
         return results
 
     def _flex_trade_to_transaction(self, row: dict[str, str]) -> Optional[UnifiedTransaction]:
-        """Parse a Flex Query trades row."""
+        """Parse a Flex Query trades row.
+
+        Handles both detailed Flex Query column names (TradePrice, CurrencyPrimary,
+        IBCommission) and Activity Statement summary names (T. Price, Currency, Comm/Fee).
+        """
         try:
             asset_cat = row.get("Asset Category", row.get("AssetCategory", "")).lower()
             if asset_cat in ("forex", "cash"):
@@ -414,9 +508,13 @@ class IBKRParser(BaseParser):
             settle_str = row.get("SettleDateTarget", row.get("SettleDate", ""))
             settle = _parse_ibkr_datetime(settle_str).date() if settle_str else trade_dt.date()
 
-            price = _safe_decimal(row.get("TradePrice", "0"))
-            currency = row.get("CurrencyPrimary", "USD").strip()
-            commission = abs(_safe_decimal(row.get("IBCommission", row.get("Commission", "0"))))
+            price = _safe_decimal(
+                row.get("TradePrice", row.get("T. Price", "0"))
+            )
+            currency = row.get("CurrencyPrimary", row.get("Currency", "USD")).strip()
+            commission = abs(_safe_decimal(
+                row.get("IBCommission", row.get("Commission", row.get("Comm/Fee", "0")))
+            ))
 
             row_id = _make_id(f"IBKR_FLEX_{symbol}{trade_dt}{qty}{price}")
 
@@ -441,10 +539,24 @@ class IBKRParser(BaseParser):
     def _flex_div_to_transaction(
         self, row: dict[str, str], action: ActionType
     ) -> Optional[UnifiedTransaction]:
-        """Parse a Flex Query dividend/WHT row."""
+        """Parse a Flex Query dividend/WHT row.
+
+        Handles both detailed Flex Query format (separate Symbol column) and
+        Activity Statement format (symbol embedded in Description like
+        'TRET(NL0009690239) Cash Dividend EUR 0.32 per Share').
+        """
         try:
             symbol = row.get("Symbol", "").strip()
             if not symbol:
+                # Activity Statement: extract symbol from Description
+                desc = row.get("Description", "")
+                if desc and "(" in desc:
+                    symbol = desc.split("(")[0].strip()
+            if not symbol:
+                return None
+
+            # Skip "Total" summary rows
+            if symbol.lower() in ("total", "total in usd"):
                 return None
 
             date_str = row.get("Date", row.get("DateTime", row.get("ReportDate", "")))
@@ -453,15 +565,24 @@ class IBKRParser(BaseParser):
             pay_dt = _parse_ibkr_datetime(date_str)
 
             amount = _safe_decimal(row.get("Amount", row.get("Tax", "0")))
-            currency = row.get("CurrencyPrimary", "USD").strip()
+            currency = row.get("CurrencyPrimary", row.get("Currency", "USD")).strip()
 
             row_id = _make_id(f"IBKR_FLEX_{action.value}_{symbol}{pay_dt}{amount}")
+            isin_val = row.get("ISIN") or None
+            # Try to extract ISIN from Description: "TRET(NL0009690239) Cash Dividend..."
+            if not isin_val:
+                desc = row.get("Description", "")
+                isin_match = re.search(r"\(([A-Z]{2}[A-Z0-9]{9,10})\)", desc)
+                if isin_match:
+                    isin_val = isin_match.group(1)
+            country = isin_val[:2].upper() if isin_val and len(isin_val) >= 2 and isin_val[:2].isalpha() else None
 
             return UnifiedTransaction(
                 id=row_id,
                 broker=BrokerName.IBKR,
                 symbol=symbol,
-                isin=row.get("ISIN") or None,
+                isin=isin_val,
+                country=country,
                 description=row.get("Description") or None,
                 trade_date=pay_dt,
                 settlement_date=pay_dt.date(),
@@ -473,6 +594,73 @@ class IBKRParser(BaseParser):
             )
         except Exception as e:
             logger.warning("Failed to parse IBKR flex div: %s – %s", row, e)
+            return None
+
+    def _flex_transfer_to_transaction(self, row: dict[str, str]) -> Optional[UnifiedTransaction]:
+        """Parse a Flex Query or raw CSV transfer row as a BUY (transfer-in) or SELL (transfer-out).
+
+        Handles both Flex Query column names (Qty, Currency, Market Value, Asset Category,
+        Xfer Account) and raw CSV column names (Quantity, CurrencyPrimary, PositionAmount,
+        AssetClass, TransferAccount).
+        """
+        try:
+            direction = row.get("Direction", "").strip()
+            direction_upper = direction.upper()
+            if direction_upper not in ("IN", "OUT"):
+                return None
+
+            asset_cat = row.get("Asset Category", row.get("AssetClass", "")).lower()
+            if asset_cat in ("forex", "cash", ""):
+                return None
+
+            symbol = row.get("Symbol", "").strip()
+            if not symbol or symbol == "--":
+                return None
+
+            qty = _safe_decimal(row.get("Qty", row.get("Quantity", "0")))
+            if qty <= 0:
+                return None
+
+            date_str = row.get("Date", "")
+            if not date_str:
+                return None
+            transfer_dt = _parse_ibkr_datetime(date_str)
+
+            currency = row.get("Currency", row.get("CurrencyPrimary", "USD")).strip()
+            market_value = abs(_safe_decimal(
+                row.get("Market Value", row.get("PositionAmount", "0"))
+            ))
+
+            # Compute price from market value / qty
+            price = (market_value / qty).quantize(Decimal("0.0001")) if qty > 0 else Decimal("0")
+
+            action = ActionType.BUY if direction_upper == "IN" else ActionType.SELL
+            settle = _estimate_settlement_date(transfer_dt.date(), currency)
+
+            xfer_account = row.get("Xfer Account", row.get("TransferAccount", ""))
+            row_id = _make_id(f"IBKR_XFER_{symbol}_{transfer_dt}_{qty}_{direction}")
+
+            logger.info(
+                "Transfer %s: %s %s %s x %s @ %s %s (from %s)",
+                direction, action.value, symbol, qty, price, currency, transfer_dt.date(), xfer_account,
+            )
+
+            return UnifiedTransaction(
+                id=row_id,
+                broker=BrokerName.IBKR,
+                symbol=symbol,
+                isin=None,
+                description=f"Transfer {direction} (from {xfer_account})" if xfer_account else f"Transfer {direction}",
+                trade_date=transfer_dt,
+                settlement_date=settle,
+                action=action,
+                quantity=qty,
+                price=price,
+                currency=currency,
+                commission=Decimal("0"),
+            )
+        except Exception as e:
+            logger.warning("Failed to parse IBKR flex transfer: %s – %s", row, e)
             return None
 
 

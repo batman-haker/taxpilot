@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useMemo, DragEvent, ChangeEvent } from "react";
+import { MonthlyPnlChart, WinLossDonut, SymbolPnlChart, DividendChart } from "@/app/components/charts";
 
 // ---------------------------------------------------------------------------
 // Types matching the backend response
@@ -36,6 +37,7 @@ interface FifoMatch {
   sell_revenue_pln: string;
   profit_pln: string;
   is_orphan?: boolean;
+  broker?: string;
 }
 
 interface DividendItem {
@@ -52,6 +54,7 @@ interface DividendItem {
   wht_nbp_rate: string;
   polish_tax_due: string;
   tax_to_pay_poland: string;
+  broker?: string;
 }
 
 interface CapitalGainsSummary {
@@ -86,6 +89,18 @@ interface OpenPosition {
   currency: string;
   cost_pln: string;
   nbp_rate: string;
+  broker?: string;
+}
+
+interface ShortPosition {
+  symbol: string;
+  quantity: string;
+  sell_date: string;
+  sell_price: string;
+  currency: string;
+  revenue_pln: string;
+  nbp_rate: string;
+  broker?: string;
 }
 
 interface YearSummary {
@@ -148,6 +163,7 @@ interface TaxReport {
   dividends: DividendSummary;
   pit_zg: CountryBreakdown[];
   open_positions: OpenPosition[];
+  open_short_positions: ShortPosition[];
   warnings: string[];
   portfolio: PortfolioReport | null;
 }
@@ -282,6 +298,30 @@ interface PAApiResponse {
   report: PortfolioAnalysisReport;
 }
 
+interface IkeIkzePosition {
+  account_type: string;
+  symbol: string;
+  exchange: string;
+  currency: string;
+  country: string | null;
+  quantity: string;
+  avg_buy_price: string;
+  current_price: string;
+  change_pct: string;
+  pnl_pln: string;
+  market_value_pln: string;
+}
+
+interface IkeIkzeReport {
+  positions: IkeIkzePosition[];
+  warnings: string[];
+}
+
+interface IkeIkzeApiResponse {
+  filename: string;
+  report: IkeIkzeReport;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -346,10 +386,12 @@ const yearOptions = Array.from({ length: 6 }, (_, i) => currentYear - 1 - i);
 
 export default function HomePage() {
   // Form state
-  const [files, setFiles] = useState<File[]>([]);
+  const [ibkrFiles, setIbkrFiles] = useState<File[]>([]);
+  const [exanteFiles, setExanteFiles] = useState<File[]>([]);
   const [taxYear, setTaxYear] = useState<number>(currentYear - 1);
   const [priorYearLoss, setPriorYearLoss] = useState<string>("");
-  const [isDragging, setIsDragging] = useState(false);
+  const [isDraggingIbkr, setIsDraggingIbkr] = useState(false);
+  const [isDraggingExante, setIsDraggingExante] = useState(false);
   const [manualBuys, setManualBuys] = useState<ManualBuy[]>([]);
 
   // Result state
@@ -371,6 +413,8 @@ export default function HomePage() {
   // Education sections
   const [showEdu, setShowEdu] = useState(false);
   const [eduSection, setEduSection] = useState<string | null>(null);
+  const [showIbkrHelp, setShowIbkrHelp] = useState(false);
+  const [showExanteHelp, setShowExanteHelp] = useState(false);
 
   // Portfolio Analysis state (IBKR Performance Report)
   const [paLoading, setPaLoading] = useState(false);
@@ -383,7 +427,16 @@ export default function HomePage() {
   const [showPaSymbolPerf, setShowPaSymbolPerf] = useState(false);
   const [showPaTrades, setShowPaTrades] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // IKE/IKZE state
+  const [ikeFiles, setIkeFiles] = useState<File[]>([]);
+  const [isDraggingIke, setIsDraggingIke] = useState(false);
+  const [ikeLoading, setIkeLoading] = useState(false);
+  const [ikeError, setIkeError] = useState<string | null>(null);
+  const [ikeResult, setIkeResult] = useState<IkeIkzeApiResponse | null>(null);
+
+  const ibkrFileInputRef = useRef<HTMLInputElement>(null);
+  const exanteFileInputRef = useRef<HTMLInputElement>(null);
+  const ikeFileInputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
   const paResultsRef = useRef<HTMLDivElement>(null);
 
@@ -393,18 +446,17 @@ export default function HomePage() {
     const matches = result.report.capital_gains.matches;
     const divItems = result.report.dividends.items;
 
-    // P&L per symbol
-    const symbolPnl: Record<string, { revenue: number; cost: number; profit: number; trades: number }> = {};
+    // P&L per symbol+broker
+    const symbolPnl: Record<string, { symbol: string; broker: string; revenue: number; cost: number; profit: number; trades: number }> = {};
     for (const m of matches) {
-      const s = m.symbol;
-      if (!symbolPnl[s]) symbolPnl[s] = { revenue: 0, cost: 0, profit: 0, trades: 0 };
-      symbolPnl[s].revenue += parseFloat(m.sell_revenue_pln);
-      symbolPnl[s].cost += parseFloat(m.buy_cost_pln);
-      symbolPnl[s].profit += parseFloat(m.profit_pln);
-      symbolPnl[s].trades += 1;
+      const key = `${m.symbol}|${m.broker || "?"}`;
+      if (!symbolPnl[key]) symbolPnl[key] = { symbol: m.symbol, broker: m.broker || "?", revenue: 0, cost: 0, profit: 0, trades: 0 };
+      symbolPnl[key].revenue += parseFloat(m.sell_revenue_pln);
+      symbolPnl[key].cost += parseFloat(m.buy_cost_pln);
+      symbolPnl[key].profit += parseFloat(m.profit_pln);
+      symbolPnl[key].trades += 1;
     }
-    const symbolPnlList = Object.entries(symbolPnl)
-      .map(([symbol, d]) => ({ symbol, ...d }))
+    const symbolPnlList = Object.values(symbolPnl)
       .sort((a, b) => b.profit - a.profit);
 
     // Best / worst trades (top 5 each)
@@ -418,18 +470,17 @@ export default function HomePage() {
     const totalBuyCommission = matches.reduce((s, m) => s + parseFloat(m.buy_commission), 0);
     const totalSellCommission = matches.reduce((s, m) => s + parseFloat(m.sell_commission), 0);
 
-    // Dividend per symbol
-    const divBySymbol: Record<string, { gross: number; wht: number; toPay: number; count: number }> = {};
+    // Dividend per symbol+broker
+    const divBySymbol: Record<string, { symbol: string; broker: string; gross: number; wht: number; toPay: number; count: number }> = {};
     for (const d of divItems) {
-      const s = d.symbol;
-      if (!divBySymbol[s]) divBySymbol[s] = { gross: 0, wht: 0, toPay: 0, count: 0 };
-      divBySymbol[s].gross += parseFloat(d.gross_amount_pln);
-      divBySymbol[s].wht += parseFloat(d.wht_amount_pln);
-      divBySymbol[s].toPay += parseFloat(d.tax_to_pay_poland);
-      divBySymbol[s].count += 1;
+      const key = `${d.symbol}|${d.broker || "?"}`;
+      if (!divBySymbol[key]) divBySymbol[key] = { symbol: d.symbol, broker: d.broker || "?", gross: 0, wht: 0, toPay: 0, count: 0 };
+      divBySymbol[key].gross += parseFloat(d.gross_amount_pln);
+      divBySymbol[key].wht += parseFloat(d.wht_amount_pln);
+      divBySymbol[key].toPay += parseFloat(d.tax_to_pay_poland);
+      divBySymbol[key].count += 1;
     }
-    const divBySymbolList = Object.entries(divBySymbol)
-      .map(([symbol, d]) => ({ symbol, ...d }))
+    const divBySymbolList = Object.values(divBySymbol)
       .sort((a, b) => b.gross - a.gross);
 
     // Currency breakdown
@@ -451,6 +502,22 @@ export default function HomePage() {
       : 0;
     const uniqueSymbols = new Set(matches.map((m) => m.symbol)).size;
 
+    // Monthly P&L timeline
+    const monthlyPnl: Record<string, number> = {};
+    for (const m of matches) {
+      const d = new Date(m.sell_date);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      monthlyPnl[key] = (monthlyPnl[key] || 0) + parseFloat(m.profit_pln);
+    }
+    const monthlyPnlList: Array<{ month: string; profit: number; cumulative: number }> = Object.entries(monthlyPnl)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([month, profit]) => ({ month, profit, cumulative: 0 }));
+    let cumulative = 0;
+    for (const entry of monthlyPnlList) {
+      cumulative += entry.profit;
+      entry.cumulative = cumulative;
+    }
+
     return {
       symbolPnlList,
       bestTrades,
@@ -464,56 +531,64 @@ export default function HomePage() {
       lossTrades,
       avgProfit,
       uniqueSymbols,
+      monthlyPnlList,
     };
   }, [result]);
 
-  // ---- Drag & Drop handlers ----
+  // ---- Drag & Drop handlers (per broker) ----
 
-  const handleDragEnter = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-  }, []);
-
-  const handleDragOver = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  }, []);
-
-  const handleDrop = useCallback((e: DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-
-    const droppedFiles = Array.from(e.dataTransfer.files).filter(
+  const filterCsvFiles = (fileList: FileList) =>
+    Array.from(fileList).filter(
       (f) =>
         f.name.endsWith(".csv") ||
         f.name.endsWith(".xlsx") ||
         f.name.endsWith(".xls")
     );
-    if (droppedFiles.length > 0) {
-      setFiles((prev) => [...prev, ...droppedFiles]);
-      setError(null);
-    }
+
+  const makeDragHandlers = (
+    setDragging: (v: boolean) => void,
+    setFiles: React.Dispatch<React.SetStateAction<File[]>>
+  ) => ({
+    onDragEnter: (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); setDragging(true); },
+    onDragLeave: (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); setDragging(false); },
+    onDragOver: (e: DragEvent) => { e.preventDefault(); e.stopPropagation(); },
+    onDrop: (e: DragEvent) => {
+      e.preventDefault(); e.stopPropagation(); setDragging(false);
+      const dropped = filterCsvFiles(e.dataTransfer.files);
+      if (dropped.length > 0) { setFiles((prev) => [...prev, ...dropped]); setError(null); }
+    },
+  });
+
+  const ibkrDrag = useMemo(() => makeDragHandlers(setIsDraggingIbkr, setIbkrFiles), []);
+  const exanteDrag = useMemo(() => makeDragHandlers(setIsDraggingExante, setExanteFiles), []);
+  const ikeDrag = useMemo(() => makeDragHandlers(setIsDraggingIke, setIkeFiles), []);
+
+  const handleIbkrFileSelect = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) { setIbkrFiles((prev) => [...prev, ...Array.from(e.target.files!)]); setError(null); }
   }, []);
 
-  const handleFileSelect = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      const selected = Array.from(e.target.files);
-      setFiles((prev) => [...prev, ...selected]);
-      setError(null);
-    }
+  const handleExanteFileSelect = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) { setExanteFiles((prev) => [...prev, ...Array.from(e.target.files!)]); setError(null); }
   }, []);
 
-  const removeFile = useCallback((index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
+  const handleIkeFileSelect = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) { setIkeFiles((prev) => [...prev, ...Array.from(e.target.files!)]); setIkeError(null); }
   }, []);
+
+  const removeIbkrFile = useCallback((index: number) => {
+    setIbkrFiles((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const removeExanteFile = useCallback((index: number) => {
+    setExanteFiles((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  const removeIkeFile = useCallback((index: number) => {
+    setIkeFiles((prev) => prev.filter((_, i) => i !== index));
+  }, []);
+
+  // Combined files for backward compat
+  const files = useMemo(() => [...ibkrFiles, ...exanteFiles], [ibkrFiles, exanteFiles]);
 
   // ---- Manual buy handlers ----
 
@@ -544,6 +619,7 @@ export default function HomePage() {
 
     setLoading(true);
     setError(null);
+    setPaError(null);
     setResult(null);
 
     const formData = new FormData();
@@ -623,6 +699,36 @@ export default function HomePage() {
     }
   };
 
+  const handleIkeIkzeUpload = async () => {
+    if (ikeFiles.length === 0) {
+      setIkeError("Nie wybrano pliku. Przeciagnij arkusz CSV z IKE/IKZE.");
+      return;
+    }
+    setIkeLoading(true);
+    setIkeError(null);
+    setIkeResult(null);
+
+    const formData = new FormData();
+    formData.append("file", ikeFiles[0]);
+
+    try {
+      const response = await fetch("http://localhost:8000/api/ike-ikze", {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.detail || `Blad serwera (${response.status})`);
+      }
+      const data: IkeIkzeApiResponse = await response.json();
+      setIkeResult(data);
+    } catch (err) {
+      setIkeError(err instanceof Error ? err.message : "Nieoczekiwany blad.");
+    } finally {
+      setIkeLoading(false);
+    }
+  };
+
   // ---- Render ----
 
   return (
@@ -670,7 +776,7 @@ export default function HomePage() {
               1. Wgraj pliki z brokera
             </h2>
             <p className="text-sm text-slate-400">
-              Obslugiwane formaty: CSV i XLSX z Interactive Brokers, Exante i Revolut
+              Wgraj pliki z kazdego brokera do odpowiedniego pola
             </p>
             <div className="mt-3 rounded-lg bg-blue-500/10 border border-blue-500/20 px-4 py-3 space-y-2">
               <p className="text-xs text-blue-300">
@@ -690,105 +796,430 @@ export default function HomePage() {
             </div>
           </div>
 
-          {/* Drop zone */}
-          <div
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`
-              relative cursor-pointer rounded-xl border-2 border-dashed
-              transition-all duration-200
-              flex flex-col items-center justify-center py-12 px-6
-              ${
-                isDragging
-                  ? "drop-zone-active border-blue-500 bg-blue-500/5"
-                  : "border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-900/70"
-              }
-            `}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              accept=".csv,.xlsx,.xls"
-              onChange={handleFileSelect}
-              className="hidden"
-            />
-            <svg
-              className={`w-12 h-12 mb-4 ${isDragging ? "text-blue-400" : "text-slate-500"}`}
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth={1.5}
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.338-2.32 4.5 4.5 0 013.09 8.362M12 9.75V3.75"
-              />
-            </svg>
-            <p className="text-sm text-slate-300 font-medium">
-              {isDragging
-                ? "Upusc pliki tutaj..."
-                : "Przeciagnij i upusc pliki CSV/XLSX"}
-            </p>
-            <p className="text-xs text-slate-500 mt-1">
-              lub kliknij, aby wybrac
+          {/* Two broker drop zones side by side */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* IBKR zone */}
+            <div className="space-y-3">
+              <div
+                {...ibkrDrag}
+                onClick={() => ibkrFileInputRef.current?.click()}
+                className={`
+                  relative cursor-pointer rounded-xl border-2 border-dashed
+                  transition-all duration-200
+                  flex flex-col items-center justify-center py-8 px-4
+                  ${
+                    isDraggingIbkr
+                      ? "drop-zone-active border-emerald-500 bg-emerald-500/5"
+                      : "border-slate-700 hover:border-emerald-600 bg-slate-900/40 hover:bg-slate-900/70"
+                  }
+                `}
+              >
+                <input
+                  ref={ibkrFileInputRef}
+                  type="file"
+                  multiple
+                  accept=".csv,.xlsx,.xls"
+                  onChange={handleIbkrFileSelect}
+                  className="hidden"
+                />
+                <svg
+                  className={`w-10 h-10 mb-3 ${isDraggingIbkr ? "text-emerald-400" : "text-slate-500"}`}
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={1.5}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.338-2.32 4.5 4.5 0 013.09 8.362M12 9.75V3.75"
+                  />
+                </svg>
+                <p className="text-sm text-emerald-300 font-semibold">Interactive Brokers</p>
+                <p className="text-xs text-slate-400 mt-1">Flex Query / Activity Statement</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {isDraggingIbkr ? "Upusc pliki..." : "Przeciagnij CSV lub kliknij"}
+                </p>
+              </div>
+              {/* IBKR help toggle */}
+              <button
+                onClick={() => setShowIbkrHelp(!showIbkrHelp)}
+                className="flex items-center gap-1 text-xs text-slate-400 hover:text-emerald-400 transition-colors mt-1"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                </svg>
+                Jak pobrac raport z IBKR?
+                <svg className={`w-3 h-3 transition-transform ${showIbkrHelp ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                </svg>
+              </button>
+              {showIbkrHelp && (
+                <div className="bg-slate-800/60 border border-slate-700/50 rounded-lg p-4 text-xs text-slate-300 space-y-3">
+                  <div>
+                    <p className="font-semibold text-emerald-300 mb-1.5">Opcja 1: Flex Query (zalecane)</p>
+                    <ol className="list-decimal list-inside space-y-1 text-slate-400">
+                      <li>Zaloguj sie do IBKR &rarr; <span className="text-slate-200">Performance &amp; Reports</span> &rarr; <span className="text-slate-200">Flex Queries</span></li>
+                      <li>Kliknij <span className="text-slate-200">&quot;+&quot;</span> aby utworzyc nowy Flex Query</li>
+                      <li>Wybierz sekcje: <span className="text-slate-200">Trades</span>, <span className="text-slate-200">Dividends</span>, <span className="text-slate-200">Withholding Tax</span>, <span className="text-slate-200">Transfers</span></li>
+                      <li>Format: <span className="text-slate-200">CSV</span>, Period: od otwarcia konta do dzis</li>
+                      <li>Pobierz i wgraj wszystkie pliki naraz</li>
+                    </ol>
+                    <div className="mt-2 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-1.5 text-amber-300">
+                      Max 365 dni na plik — wygeneruj osobne pliki za kazdy rok (np. akcje_23.csv, akcje_24.csv, akcje_25.csv)
+                    </div>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-emerald-300 mb-1.5">Opcja 2: Activity Statement</p>
+                    <ol className="list-decimal list-inside space-y-1 text-slate-400">
+                      <li><span className="text-slate-200">Reports</span> &rarr; <span className="text-slate-200">Statements</span> &rarr; <span className="text-slate-200">Activity</span></li>
+                      <li>Period: <span className="text-slate-200">Annual</span>, Format: <span className="text-slate-200">CSV</span></li>
+                      <li>Zawiera trades + dividends + WHT w jednym pliku</li>
+                      <li>Wygeneruj za kazdy rok osobno i wgraj wszystkie</li>
+                    </ol>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-emerald-300 mb-1.5">Opcjonalnie: Performance Report</p>
+                    <p className="text-slate-400"><span className="text-slate-200">Reports</span> &rarr; <span className="text-slate-200">Statements</span> &rarr; <span className="text-slate-200">Analyst / Performance</span>, Period: <span className="text-slate-200">Inception to Date</span>. Uzupelnia brakujace historyczne kupna srednia cena — wgraj razem z Flex Query.</p>
+                  </div>
+                </div>
+              )}
+              {ibkrFiles.length > 0 && (
+                <div className="space-y-1.5">
+                  {ibkrFiles.map((f, i) => (
+                    <div key={`ibkr-${f.name}-${i}`} className="flex items-center justify-between bg-emerald-900/20 border border-emerald-800/30 rounded-lg px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <svg className="w-4 h-4 text-emerald-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        <span className="text-sm text-slate-200 truncate">{f.name}</span>
+                        <span className="text-xs text-slate-500">({(f.size / 1024).toFixed(1)} KB)</span>
+                      </div>
+                      <button onClick={() => removeIbkrFile(i)} className="text-slate-500 hover:text-red-400 transition-colors p-1" aria-label="Usun plik">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Exante zone */}
+            <div className="space-y-3">
+              <div
+                {...exanteDrag}
+                onClick={() => exanteFileInputRef.current?.click()}
+                className={`
+                  relative cursor-pointer rounded-xl border-2 border-dashed
+                  transition-all duration-200
+                  flex flex-col items-center justify-center py-8 px-4
+                  ${
+                    isDraggingExante
+                      ? "drop-zone-active border-violet-500 bg-violet-500/5"
+                      : "border-slate-700 hover:border-violet-600 bg-slate-900/40 hover:bg-slate-900/70"
+                  }
+                `}
+              >
+                <input
+                  ref={exanteFileInputRef}
+                  type="file"
+                  multiple
+                  accept=".csv,.xlsx,.xls"
+                  onChange={handleExanteFileSelect}
+                  className="hidden"
+                />
+                <svg
+                  className={`w-10 h-10 mb-3 ${isDraggingExante ? "text-violet-400" : "text-slate-500"}`}
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={1.5}
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 16.5V9.75m0 0l3 3m-3-3l-3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.338-2.32 4.5 4.5 0 013.09 8.362M12 9.75V3.75"
+                  />
+                </svg>
+                <p className="text-sm text-violet-300 font-semibold">Exante</p>
+                <p className="text-xs text-slate-400 mt-1">Custom report / historia transakcji</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {isDraggingExante ? "Upusc pliki..." : "Przeciagnij CSV lub kliknij"}
+                </p>
+              </div>
+              {/* Exante help toggle */}
+              <button
+                onClick={() => setShowExanteHelp(!showExanteHelp)}
+                className="flex items-center gap-1 text-xs text-slate-400 hover:text-violet-400 transition-colors mt-1"
+              >
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                </svg>
+                Jak pobrac raport z Exante?
+                <svg className={`w-3 h-3 transition-transform ${showExanteHelp ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
+                </svg>
+              </button>
+              {showExanteHelp && (
+                <div className="bg-slate-800/60 border border-slate-700/50 rounded-lg p-4 text-xs text-slate-300 space-y-3">
+                  <div>
+                    <p className="font-semibold text-violet-300 mb-1.5">Custom Report (historia transakcji)</p>
+                    <ol className="list-decimal list-inside space-y-1 text-slate-400">
+                      <li>Zaloguj sie do Exante &rarr; <span className="text-slate-200">Reports</span> &rarr; <span className="text-slate-200">Transaction Report</span></li>
+                      <li>Zakres dat: <span className="text-slate-200">od otwarcia konta do dzis</span> (cala historia)</li>
+                      <li>Typ transakcji: <span className="text-slate-200">All transactions</span> (wszystkie)</li>
+                      <li>Format: <span className="text-slate-200">CSV</span></li>
+                      <li>Kliknij <span className="text-slate-200">Generate</span> i pobierz plik</li>
+                    </ol>
+                  </div>
+                  <div className="bg-violet-500/10 border border-violet-500/20 rounded px-3 py-1.5 text-violet-300">
+                    Jesli masz wiele kont (np. FCP0101.001, WXS2094) — pobierz osobny plik z kazdego konta. System rozpoznaje oba formaty Exante automatycznie.
+                  </div>
+                </div>
+              )}
+              {exanteFiles.length > 0 && (
+                <div className="space-y-1.5">
+                  {exanteFiles.map((f, i) => (
+                    <div key={`exa-${f.name}-${i}`} className="flex items-center justify-between bg-violet-900/20 border border-violet-800/30 rounded-lg px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <svg className="w-4 h-4 text-violet-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        <span className="text-sm text-slate-200 truncate">{f.name}</span>
+                        <span className="text-xs text-slate-500">({(f.size / 1024).toFixed(1)} KB)</span>
+                      </div>
+                      <button onClick={() => removeExanteFile(i)} className="text-slate-500 hover:text-red-400 transition-colors p-1" aria-label="Usun plik">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* ---- IKE/IKZE upload ---- */}
+        <section className="card space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold text-white mb-1 flex items-center gap-2">
+              <svg className="w-5 h-5 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" />
+              </svg>
+              Arkusz CSV — IKE / IKZE (opcjonalnie)
+            </h2>
+            <p className="text-xs text-slate-400">
+              Wgraj arkusz portfela z mBank eMakler. Konta IKE/IKZE sa zwolnione z podatku — dane sluza tylko do analizy portfela.
             </p>
           </div>
 
-          {/* File list */}
-          {files.length > 0 && (
-            <div className="space-y-2">
-              {files.map((f, i) => (
-                <div
-                  key={`${f.name}-${i}`}
-                  className="flex items-center justify-between bg-slate-800/60 rounded-lg px-4 py-2.5"
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-3">
+              <div
+                {...ikeDrag}
+                onClick={() => ikeFileInputRef.current?.click()}
+                className={`
+                  relative cursor-pointer rounded-xl border-2 border-dashed
+                  transition-all duration-200
+                  flex flex-col items-center justify-center py-8 px-4
+                  ${
+                    isDraggingIke
+                      ? "drop-zone-active border-amber-500 bg-amber-500/5"
+                      : "border-slate-700 hover:border-amber-600 bg-slate-900/40 hover:bg-slate-900/70"
+                  }
+                `}
+              >
+                <input
+                  ref={ikeFileInputRef}
+                  type="file"
+                  accept=".csv"
+                  onChange={handleIkeFileSelect}
+                  className="hidden"
+                />
+                <svg
+                  className={`w-10 h-10 mb-3 ${isDraggingIke ? "text-amber-400" : "text-slate-500"}`}
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  strokeWidth={1.5}
                 >
-                  <div className="flex items-center gap-3 min-w-0">
-                    <svg
-                      className="w-5 h-5 text-blue-400 flex-shrink-0"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                      />
-                    </svg>
-                    <span className="text-sm text-slate-200 truncate">
-                      {f.name}
-                    </span>
-                    <span className="text-xs text-slate-500">
-                      ({(f.size / 1024).toFixed(1)} KB)
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => removeFile(i)}
-                    className="text-slate-500 hover:text-red-400 transition-colors p-1"
-                    aria-label="Usun plik"
-                  >
-                    <svg
-                      className="w-4 h-4"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      strokeWidth={2}
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="M6 18L18 6M6 6l12 12"
-                      />
-                    </svg>
-                  </button>
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"
+                  />
+                </svg>
+                <p className="text-sm text-amber-300 font-semibold">IKE / IKZE</p>
+                <p className="text-xs text-slate-400 mt-1">Arkusz CSV z mBank eMakler</p>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  {isDraggingIke ? "Upusc plik..." : "Przeciagnij CSV lub kliknij"}
+                </p>
+              </div>
+              {ikeFiles.length > 0 && (
+                <div className="space-y-1.5">
+                  {ikeFiles.map((f, i) => (
+                    <div key={`ike-${f.name}-${i}`} className="flex items-center justify-between bg-amber-900/20 border border-amber-800/30 rounded-lg px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <svg className="w-4 h-4 text-amber-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                        <span className="text-sm text-slate-200 truncate">{f.name}</span>
+                        <span className="text-xs text-slate-500">({(f.size / 1024).toFixed(1)} KB)</span>
+                      </div>
+                      <button onClick={() => removeIkeFile(i)} className="text-slate-500 hover:text-red-400 transition-colors p-1" aria-label="Usun plik">
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
+            </div>
+
+            <div className="flex items-center justify-center">
+              <button
+                onClick={handleIkeIkzeUpload}
+                disabled={ikeLoading || ikeFiles.length === 0}
+                className={`
+                  px-8 py-3 rounded-xl font-semibold text-sm tracking-wide
+                  transition-all duration-200
+                  ${
+                    ikeLoading || ikeFiles.length === 0
+                      ? "bg-slate-700 text-slate-400 cursor-not-allowed"
+                      : "bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-500/20 hover:shadow-amber-500/40"
+                  }
+                `}
+              >
+                {ikeLoading ? (
+                  <span className="flex items-center gap-2">
+                    <svg className="spinner w-5 h-5" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                    </svg>
+                    Wczytywanie...
+                  </span>
+                ) : (
+                  "Wczytaj portfel IKE/IKZE"
+                )}
+              </button>
+            </div>
+          </div>
+
+          {ikeError && (
+            <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
+              {ikeError}
+            </div>
+          )}
+
+          {ikeResult && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2 text-sm text-emerald-400">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+                Wczytano {ikeResult.report.positions.length} pozycji z {ikeResult.filename}
+              </div>
+
+              {/* IKE/IKZE summary cards */}
+              {(() => {
+                const ike = ikeResult.report.positions.filter(p => p.account_type === "IKE");
+                const ikze = ikeResult.report.positions.filter(p => p.account_type === "IKZE");
+                const ikeTotal = ike.reduce((s, p) => s + parseFloat(p.market_value_pln), 0);
+                const ikzeTotal = ikze.reduce((s, p) => s + parseFloat(p.market_value_pln), 0);
+                const ikePnl = ike.reduce((s, p) => s + parseFloat(p.pnl_pln), 0);
+                const ikzePnl = ikze.reduce((s, p) => s + parseFloat(p.pnl_pln), 0);
+                return (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                    {ike.length > 0 && (<>
+                      <div className="bg-slate-800/50 rounded-lg p-3">
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">IKE — wartosc</div>
+                        <div className="text-sm font-semibold text-white">{formatPLN(ikeTotal)}</div>
+                        <div className="text-[10px] text-slate-500">{ike.length} pozycji</div>
+                      </div>
+                      <div className="bg-slate-800/50 rounded-lg p-3">
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">IKE — zysk/strata</div>
+                        <div className={`text-sm font-semibold ${profitColor(ikePnl)}`}>{formatPLN(ikePnl)}</div>
+                      </div>
+                    </>)}
+                    {ikze.length > 0 && (<>
+                      <div className="bg-slate-800/50 rounded-lg p-3">
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">IKZE — wartosc</div>
+                        <div className="text-sm font-semibold text-white">{formatPLN(ikzeTotal)}</div>
+                        <div className="text-[10px] text-slate-500">{ikze.length} pozycji</div>
+                      </div>
+                      <div className="bg-slate-800/50 rounded-lg p-3">
+                        <div className="text-[10px] text-slate-500 uppercase tracking-wider">IKZE — zysk/strata</div>
+                        <div className={`text-sm font-semibold ${profitColor(ikzePnl)}`}>{formatPLN(ikzePnl)}</div>
+                      </div>
+                    </>)}
+                  </div>
+                );
+              })()}
+
+              {/* Positions table */}
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-700">
+                      <th className="text-left py-2 px-2 text-slate-400 font-medium">Konto</th>
+                      <th className="text-left py-2 px-2 text-slate-400 font-medium">Symbol</th>
+                      <th className="text-left py-2 px-2 text-slate-400 font-medium">Gielda</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Ilosc</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Sr. cena kupna</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Cena obecna</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Zmiana</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Zysk/Strata PLN</th>
+                      <th className="text-right py-2 px-2 text-slate-400 font-medium">Wartosc PLN</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {ikeResult.report.positions.map((p, i) => (
+                      <tr key={i} className="border-b border-slate-800/50 hover:bg-slate-800/30">
+                        <td className="py-1.5 px-2">
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                            p.account_type === "IKE" ? "bg-blue-500/15 text-blue-400" : "bg-purple-500/15 text-purple-400"
+                          }`}>
+                            {p.account_type}
+                          </span>
+                        </td>
+                        <td className="py-1.5 px-2 text-slate-200 font-medium">{p.symbol}</td>
+                        <td className="py-1.5 px-2 text-slate-400">{p.exchange}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-200">{formatNumber(p.quantity, 0)}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-300">{formatNumber(p.avg_buy_price, 2)} {p.currency}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-300">{formatNumber(p.current_price, 2)} {p.currency}</td>
+                        <td className={`py-1.5 px-2 text-right ${profitColor(p.change_pct)}`}>{formatNumber(p.change_pct, 2)}%</td>
+                        <td className={`py-1.5 px-2 text-right font-medium ${profitColor(p.pnl_pln)}`}>{formatPLN(p.pnl_pln)}</td>
+                        <td className="py-1.5 px-2 text-right text-slate-200">{formatPLN(p.market_value_pln)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                  <tfoot>
+                    <tr className="border-t border-slate-700">
+                      <td colSpan={7} className="py-2 px-2 text-right text-slate-400 font-medium">Razem:</td>
+                      <td className={`py-2 px-2 text-right font-bold ${profitColor(
+                        ikeResult.report.positions.reduce((s, p) => s + parseFloat(p.pnl_pln), 0)
+                      )}`}>
+                        {formatPLN(ikeResult.report.positions.reduce((s, p) => s + parseFloat(p.pnl_pln), 0))}
+                      </td>
+                      <td className="py-2 px-2 text-right font-bold text-white">
+                        {formatPLN(ikeResult.report.positions.reduce((s, p) => s + parseFloat(p.market_value_pln), 0))}
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+
+              {ikeResult.report.warnings.length > 0 && (
+                <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-4 py-3 text-xs text-yellow-300">
+                  <p className="font-semibold mb-1">Ostrzezenia:</p>
+                  {ikeResult.report.warnings.map((w, i) => <p key={i}>{w}</p>)}
+                </div>
+              )}
             </div>
           )}
         </section>
@@ -1338,6 +1769,7 @@ export default function HomePage() {
                         <thead>
                           <tr>
                             <th>Symbol</th>
+                            <th>Broker</th>
                             <th>Kraj</th>
                             <th>Data</th>
                             <th>Waluta</th>
@@ -1354,6 +1786,7 @@ export default function HomePage() {
                               <td className="font-medium text-slate-200">
                                 {d.symbol}
                               </td>
+                              <td><span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${d.broker?.startsWith("EXANTE") ? "bg-violet-900/60 text-violet-300" : "bg-emerald-900/60 text-emerald-300"}`}>{d.broker || "?"}</span></td>
                               <td>{d.country || "-"}</td>
                               <td>{formatDate(d.pay_date)}</td>
                               <td>{d.currency}</td>
@@ -1702,6 +2135,22 @@ export default function HomePage() {
                       </div>
                     </div>
 
+                    {/* -- Charts Overview Row -- */}
+                    <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+                      <div className="lg:col-span-3 bg-slate-800/40 rounded-xl p-4">
+                        <h4 className="text-sm font-medium text-slate-300 mb-3">Zysk/strata miesiecznie</h4>
+                        <MonthlyPnlChart data={analytics.monthlyPnlList} />
+                      </div>
+                      <div className="lg:col-span-2 bg-slate-800/40 rounded-xl p-4 flex flex-col items-center">
+                        <h4 className="text-sm font-medium text-slate-300 mb-3">Skutecznosc transakcji</h4>
+                        <WinLossDonut
+                          wins={analytics.profitableTrades}
+                          losses={analytics.lossTrades}
+                          breakeven={analytics.totalTrades - analytics.profitableTrades - analytics.lossTrades}
+                        />
+                      </div>
+                    </div>
+
                     {/* -- P&L per Symbol -- */}
                     <div>
                       <h4 className="text-sm font-medium text-slate-300 mb-3">Zysk/strata per walor</h4>
@@ -1710,6 +2159,7 @@ export default function HomePage() {
                           <thead>
                             <tr>
                               <th>Symbol</th>
+                              <th>Broker</th>
                               <th>Transakcji</th>
                               <th>Przychod PLN</th>
                               <th>Koszt PLN</th>
@@ -1717,9 +2167,10 @@ export default function HomePage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {analytics.symbolPnlList.map((s) => (
-                              <tr key={s.symbol}>
+                            {analytics.symbolPnlList.map((s, i) => (
+                              <tr key={`${s.symbol}-${s.broker}-${i}`}>
                                 <td className="font-medium text-slate-200">{s.symbol}</td>
+                                <td><span className={`text-[10px] px-1.5 py-0.5 rounded ${s.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{s.broker}</span></td>
                                 <td>{s.trades}</td>
                                 <td>{formatPLN(s.revenue)}</td>
                                 <td>{formatPLN(s.cost)}</td>
@@ -1729,6 +2180,12 @@ export default function HomePage() {
                           </tbody>
                         </table>
                       </div>
+                      {analytics.symbolPnlList.length > 1 && (
+                        <div className="bg-slate-800/40 rounded-xl p-4 mt-2">
+                          <h4 className="text-sm font-medium text-slate-300 mb-2">Top 10 walorow (zysk/strata)</h4>
+                          <SymbolPnlChart data={analytics.symbolPnlList} />
+                        </div>
+                      )}
                     </div>
 
                     {/* -- Best & Worst Trades -- */}
@@ -1738,9 +2195,10 @@ export default function HomePage() {
                         <div className="space-y-2">
                           {analytics.bestTrades.map((m, i) => (
                             <div key={i} className="flex justify-between items-center bg-emerald-500/5 border border-emerald-500/10 rounded-lg px-3 py-2">
-                              <div>
+                              <div className="flex items-center gap-2">
                                 <span className="text-sm font-medium text-slate-200">{m.symbol}</span>
-                                <span className="text-xs text-slate-500 ml-2">{formatDate(m.sell_date)}</span>
+                                <span className={`text-[9px] px-1 py-0.5 rounded ${m.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{m.broker || "?"}</span>
+                                <span className="text-xs text-slate-500">{formatDate(m.sell_date)}</span>
                               </div>
                               <span className="text-sm font-semibold text-emerald-400">{formatPLN(m.profit_pln)}</span>
                             </div>
@@ -1752,9 +2210,10 @@ export default function HomePage() {
                         <div className="space-y-2">
                           {analytics.worstTrades.map((m, i) => (
                             <div key={i} className="flex justify-between items-center bg-red-500/5 border border-red-500/10 rounded-lg px-3 py-2">
-                              <div>
+                              <div className="flex items-center gap-2">
                                 <span className="text-sm font-medium text-slate-200">{m.symbol}</span>
-                                <span className="text-xs text-slate-500 ml-2">{formatDate(m.sell_date)}</span>
+                                <span className={`text-[9px] px-1 py-0.5 rounded ${m.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{m.broker || "?"}</span>
+                                <span className="text-xs text-slate-500">{formatDate(m.sell_date)}</span>
                               </div>
                               <span className="text-sm font-semibold text-red-400">{formatPLN(m.profit_pln)}</span>
                             </div>
@@ -1797,6 +2256,7 @@ export default function HomePage() {
                             <thead>
                               <tr>
                                 <th>Symbol</th>
+                                <th>Broker</th>
                                 <th>Wyplat</th>
                                 <th>Brutto PLN</th>
                                 <th>WHT PLN</th>
@@ -1805,8 +2265,9 @@ export default function HomePage() {
                             </thead>
                             <tbody>
                               {analytics.divBySymbolList.map((d) => (
-                                <tr key={d.symbol}>
+                                <tr key={`${d.symbol}|${d.broker}`}>
                                   <td className="font-medium text-slate-200">{d.symbol}</td>
+                                  <td><span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${d.broker?.startsWith("EXANTE") ? "bg-violet-900/60 text-violet-300" : "bg-emerald-900/60 text-emerald-300"}`}>{d.broker}</span></td>
                                   <td>{d.count}</td>
                                   <td>{formatPLN(d.gross)}</td>
                                   <td>{formatPLN(d.wht)}</td>
@@ -1816,6 +2277,12 @@ export default function HomePage() {
                             </tbody>
                           </table>
                         </div>
+                        {analytics.divBySymbolList.length > 1 && (
+                          <div className="bg-slate-800/40 rounded-xl p-4 mt-3">
+                            <h4 className="text-sm font-medium text-slate-300 mb-2">Dywidendy — wykres</h4>
+                            <DividendChart data={analytics.divBySymbolList} />
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -1954,22 +2421,31 @@ export default function HomePage() {
                                   <td className="text-center">{ys.num_trades}</td>
                                 </tr>
                               ))}
-                              {/* Totals row */}
-                              {result.report.portfolio.year_summaries.length > 1 && (
-                                <tr className="border-t border-slate-600 font-semibold">
-                                  <td className="text-slate-200">Razem</td>
-                                  <td>{formatPLN(result.report.portfolio.metrics.total_revenue_pln)}</td>
-                                  <td>{formatPLN(result.report.portfolio.metrics.total_invested_pln)}</td>
-                                  <td className={profitColor(result.report.portfolio.metrics.total_realized_profit_pln)}>
-                                    {formatPLN(result.report.portfolio.metrics.total_realized_profit_pln)}
-                                  </td>
-                                  <td>—</td>
-                                  <td>{formatPLN(result.report.portfolio.metrics.total_dividends_gross_pln)}</td>
-                                  <td>{formatPLN(result.report.portfolio.metrics.total_wht_paid_pln)}</td>
-                                  <td>—</td>
-                                  <td className="text-center">{result.report.portfolio.metrics.total_trades}</td>
-                                </tr>
-                              )}
+                              {/* Totals row — sum per-year values (closed positions only) */}
+                              {result.report.portfolio.year_summaries.length > 1 && (() => {
+                                const ys = result.report.portfolio.year_summaries;
+                                const sumRevenue = ys.reduce((a, y) => a + parseFloat(y.revenue_pln), 0);
+                                const sumCosts = ys.reduce((a, y) => a + parseFloat(y.costs_pln), 0);
+                                const sumProfit = ys.reduce((a, y) => a + parseFloat(y.profit_pln), 0);
+                                const sumDivGross = ys.reduce((a, y) => a + parseFloat(y.dividends_gross_pln), 0);
+                                const sumDivWht = ys.reduce((a, y) => a + parseFloat(y.dividends_wht_pln), 0);
+                                const sumTrades = ys.reduce((a, y) => a + y.num_trades, 0);
+                                return (
+                                  <tr className="border-t border-slate-600 font-semibold">
+                                    <td className="text-slate-200">Razem</td>
+                                    <td>{formatPLN(sumRevenue.toFixed(2))}</td>
+                                    <td>{formatPLN(sumCosts.toFixed(2))}</td>
+                                    <td className={profitColor(sumProfit.toFixed(2))}>
+                                      {formatPLN(sumProfit.toFixed(2))}
+                                    </td>
+                                    <td>—</td>
+                                    <td>{formatPLN(sumDivGross.toFixed(2))}</td>
+                                    <td>{formatPLN(sumDivWht.toFixed(2))}</td>
+                                    <td>—</td>
+                                    <td className="text-center">{sumTrades}</td>
+                                  </tr>
+                                );
+                              })()}
                             </tbody>
                           </table>
                         </div>
@@ -2046,6 +2522,7 @@ export default function HomePage() {
                     <thead>
                       <tr>
                         <th>Symbol</th>
+                        <th>Broker</th>
                         <th>Ilosc</th>
                         <th>Data kupna</th>
                         <th>Cena kupna</th>
@@ -2058,12 +2535,58 @@ export default function HomePage() {
                       {result.report.open_positions.map((p, i) => (
                         <tr key={i}>
                           <td className="font-medium text-slate-200">{p.symbol}</td>
+                          <td><span className={`text-xs px-1.5 py-0.5 rounded ${p.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{p.broker || "?"}</span></td>
                           <td>{formatNumber(p.quantity, 4)}</td>
                           <td>{formatDate(p.buy_date)}</td>
                           <td>{formatNumber(p.buy_price, 4)}</td>
                           <td>{p.currency}</td>
                           <td>{formatNumber(p.nbp_rate, 4)}</td>
                           <td>{formatPLN(p.cost_pln)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+
+            {/* ---- Open Short Positions (written options) ---- */}
+            {result.report.open_short_positions && result.report.open_short_positions.length > 0 && (
+              <section className="card space-y-4">
+                <h3 className="text-base font-semibold text-white flex items-center gap-2">
+                  <svg className="w-5 h-5 text-orange-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
+                  </svg>
+                  Otwarte krotkie pozycje (wystawione opcje)
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Opcje/derywaty sprzedane (wystawione), ktore nie zostaly jeszcze zamkniete ani nie wygasly. Nie podlegaja opodatkowaniu do zamkniecia pozycji.
+                </p>
+                <div className="overflow-x-auto">
+                  <table className="data-table w-full text-xs">
+                    <thead>
+                      <tr>
+                        <th>Symbol</th>
+                        <th>Broker</th>
+                        <th>Ilosc</th>
+                        <th>Data sprzedazy</th>
+                        <th>Cena sprzedazy</th>
+                        <th>Waluta</th>
+                        <th>Kurs NBP</th>
+                        <th>Przychod PLN</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {result.report.open_short_positions.map((p, i) => (
+                        <tr key={i}>
+                          <td className="font-medium text-slate-200">{p.symbol}</td>
+                          <td><span className={`text-xs px-1.5 py-0.5 rounded ${p.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{p.broker || "?"}</span></td>
+                          <td>{formatNumber(p.quantity, 4)}</td>
+                          <td>{formatDate(p.sell_date)}</td>
+                          <td>{formatNumber(p.sell_price, 4)}</td>
+                          <td>{p.currency}</td>
+                          <td>{formatNumber(p.nbp_rate, 4)}</td>
+                          <td>{formatPLN(p.revenue_pln)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2154,6 +2677,7 @@ export default function HomePage() {
                       <thead>
                         <tr>
                           <th>Symbol</th>
+                          <th>Broker</th>
                           <th>Ilosc</th>
                           <th>Data kupna</th>
                           <th>Cena kupna</th>
@@ -2178,6 +2702,7 @@ export default function HomePage() {
                                 </span>
                               )}
                             </td>
+                            <td><span className={`text-[10px] px-1.5 py-0.5 rounded ${m.broker?.startsWith("EXANTE") ? "bg-violet-900/40 text-violet-300" : "bg-emerald-900/40 text-emerald-300"}`}>{m.broker || "?"}</span></td>
                             <td>{formatNumber(m.quantity, 4)}</td>
                             <td>{m.is_orphan ? "-" : formatDate(m.buy_date)}</td>
                             <td>{m.is_orphan ? "-" : formatNumber(m.buy_price, 4)}</td>
@@ -2205,7 +2730,7 @@ export default function HomePage() {
         )}
 
         {/* ---- Portfolio Analysis Error ---- */}
-        {paError && (
+        {paError && !result && (
           <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-6 py-4 text-sm text-red-300">
             <div className="flex gap-3 items-start">
               <svg className="w-5 h-5 text-red-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>

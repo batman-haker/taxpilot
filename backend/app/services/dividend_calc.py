@@ -74,7 +74,7 @@ class DividendCalculator:
             )
             to_pay = max(Decimal("0"), polish_tax - wht_pln)
 
-            country = _country_from_isin(div.isin)
+            country = div.country or _country_from_isin(div.isin)
 
             results.append(
                 DividendResult(
@@ -91,6 +91,7 @@ class DividendCalculator:
                     wht_nbp_rate=wht_rate,
                     polish_tax_due=polish_tax,
                     tax_to_pay_poland=to_pay,
+                    broker=div.broker,
                 )
             )
 

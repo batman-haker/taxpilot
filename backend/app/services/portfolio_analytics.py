@@ -42,7 +42,7 @@ class PortfolioAnalytics:
         symbol_summaries = self._build_symbol_summaries(
             all_matches, all_dividends, open_positions
         )
-        metrics = self._build_metrics(all_matches, all_dividends)
+        metrics = self._build_metrics(all_matches, all_dividends, open_positions)
 
         return PortfolioReport(
             year_summaries=year_summaries,
@@ -199,16 +199,20 @@ class PortfolioAnalytics:
         self,
         matches: list[FifoMatch],
         dividends: list[DividendResult],
+        open_positions: list[OpenPosition],
     ) -> PortfolioMetrics:
-        total_invested = sum((m.buy_cost_pln for m in matches), Decimal("0"))
+        matched_invested = sum((m.buy_cost_pln for m in matches), Decimal("0"))
+        open_invested = sum((op.cost_pln for op in open_positions), Decimal("0"))
+        total_invested = matched_invested + open_invested
         total_revenue = sum((m.sell_revenue_pln for m in matches), Decimal("0"))
-        total_profit = total_revenue - total_invested
+        total_profit = total_revenue - matched_invested  # realized profit (closed only)
 
         total_commissions = sum(
             (m.buy_commission * m.buy_nbp_rate + m.sell_commission * m.sell_nbp_rate
              for m in matches),
             Decimal("0"),
         )
+        # Note: OpenPosition doesn't track commission separately (included in cost_pln)
 
         total_div_gross = sum((d.gross_amount_pln for d in dividends), Decimal("0"))
         total_wht = sum((d.wht_amount_pln for d in dividends), Decimal("0"))
@@ -249,6 +253,8 @@ class PortfolioAnalytics:
             all_dates.append(_to_date(m.sell_date))
         for d in dividends:
             all_dates.append(_to_date(d.pay_date))
+        for op in open_positions:
+            all_dates.append(_to_date(op.buy_date))
 
         if all_dates:
             all_dates.sort()
@@ -260,7 +266,9 @@ class PortfolioAnalytics:
             last_trade = ""
             account_age = 0
 
-        unique_symbols = len(set(m.symbol for m in matches))
+        unique_symbols = len(
+            set(m.symbol for m in matches) | set(op.symbol for op in open_positions)
+        )
 
         return PortfolioMetrics(
             total_invested_pln=total_invested.quantize(TWO_PLACES, ROUND_HALF_UP),

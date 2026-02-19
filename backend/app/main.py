@@ -7,7 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -17,9 +17,10 @@ from fastapi.responses import JSONResponse
 
 from collections import defaultdict
 
-from app.models import ActionType, BrokerName, TaxReport, UnifiedTransaction
+from app.models import ActionType, BrokerName, OpenPosition, TaxReport, UnifiedTransaction
 from app.parsers.detector import detect_and_parse
 from app.parsers.ibkr_performance import IBKRPerformanceParser
+from app.parsers.ike_ikze import IkeIkzeParser
 from app.services.nbp_client import NbpClient, settlement_date_for_trade
 from app.services.tax_report import TaxReportGenerator
 
@@ -109,6 +110,95 @@ def _build_manual_transactions(manual_buys_json: str) -> tuple[list[UnifiedTrans
     return transactions, skipped
 
 
+def _supplement_open_positions(report: TaxReport, perf_report, nbp_client: NbpClient) -> None:
+    """
+    Add open positions from Performance report that aren't covered by FIFO.
+    This handles positions bought before the Activity Statement period.
+    """
+    # Aggregate FIFO open position quantities per symbol
+    fifo_qty: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    for pos in report.open_positions:
+        fifo_qty[pos.symbol] += pos.quantity
+
+    for pa_pos in perf_report.open_positions:
+        fifo_has = fifo_qty.get(pa_pos.symbol, Decimal("0"))
+        shortfall = pa_pos.quantity - fifo_has
+
+        if shortfall <= 0:
+            continue
+
+        currency = _normalize_currency(pa_pos.currency or "USD")
+
+        # Compute avg price from cost_basis / quantity
+        avg_price = (
+            (pa_pos.cost_basis / pa_pos.quantity).quantize(Decimal("0.0001"))
+            if pa_pos.quantity > 0
+            else Decimal("0")
+        )
+
+        # Use report period_start as approximate buy date
+        buy_date_dt = None
+        for fmt in ("%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                buy_date_dt = datetime.strptime(perf_report.period_start, fmt)
+                break
+            except ValueError:
+                continue
+        buy_dt = (buy_date_dt or datetime(2020, 1, 2)).date()
+
+        # Get NBP rate
+        try:
+            settle = settlement_date_for_trade(buy_dt, "US" if currency == "USD" else "")
+            rate, _ = nbp_client.get_rate(currency, settle)
+        except Exception:
+            rate = Decimal("1")
+
+        cost_pln = (avg_price * shortfall * rate).quantize(Decimal("0.01"))
+
+        report.open_positions.append(OpenPosition(
+            symbol=pa_pos.symbol,
+            quantity=shortfall,
+            buy_date=buy_dt,
+            buy_price=avg_price,
+            currency=currency,
+            cost_pln=cost_pln,
+            nbp_rate=rate,
+            broker="IBKR (Performance)",
+        ))
+
+    logger.info(
+        "Supplemented open positions: %d total after merge",
+        len(report.open_positions),
+    )
+
+
+# Map common full currency names (from IBKR Performance report) to ISO codes
+_CURRENCY_NAME_TO_ISO = {
+    "UNITED STATES DOLLAR": "USD",
+    "US DOLLAR": "USD",
+    "EURO": "EUR",
+    "BRITISH POUND": "GBP",
+    "SWISS FRANC": "CHF",
+    "JAPANESE YEN": "JPY",
+    "CANADIAN DOLLAR": "CAD",
+    "AUSTRALIAN DOLLAR": "AUD",
+    "POLISH ZLOTY": "PLN",
+    "SWEDISH KRONA": "SEK",
+    "DANISH KRONE": "DKK",
+    "NORWEGIAN KRONE": "NOK",
+}
+
+
+def _normalize_currency(raw: str) -> str:
+    """Normalize full currency names to ISO 3-letter codes."""
+    if not raw:
+        return "USD"
+    upper = raw.strip().upper()
+    if len(upper) <= 4 and upper.isalpha():
+        return upper
+    return _CURRENCY_NAME_TO_ISO.get(upper, upper)
+
+
 def _build_supplementary_buys(
     existing_transactions: list[UnifiedTransaction],
     perf_report,
@@ -122,29 +212,21 @@ def _build_supplementary_buys(
 
     Returns (synthetic_transactions, warnings).
     """
-    # Count per-symbol buy/sell quantities from Activity Statement
+    # Count per-symbol buy/sell quantities and find earliest sell date
     symbol_buys: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
     symbol_sells: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+    earliest_sell: dict[str, datetime] = {}
 
     for tx in existing_transactions:
         if tx.action == ActionType.BUY:
             symbol_buys[tx.symbol] += tx.quantity
         elif tx.action == ActionType.SELL:
             symbol_sells[tx.symbol] += tx.quantity
+            if tx.symbol not in earliest_sell or tx.trade_date < earliest_sell[tx.symbol]:
+                earliest_sell[tx.symbol] = tx.trade_date
 
     # Build lookup from Performance report Trade Summary
     trade_lookup = {ts.symbol: ts for ts in perf_report.trade_summaries}
-
-    # Parse period_start for synthetic buy date (inception date of the report)
-    buy_date = None
-    for fmt in ("%B %d, %Y", "%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            buy_date = datetime.strptime(perf_report.period_start, fmt).replace(hour=12)
-            break
-        except ValueError:
-            continue
-    if not buy_date:
-        buy_date = datetime(2020, 1, 2, 12, 0)
 
     supplementary = []
     warnings = []
@@ -160,8 +242,17 @@ def _build_supplementary_buys(
         if not trade_data or trade_data.avg_buy_price <= 0:
             continue
 
-        currency = trade_data.currency or perf_report.base_currency
+        currency = _normalize_currency(
+            trade_data.currency or perf_report.base_currency
+        )
         price = trade_data.avg_buy_price
+
+        # Use day before earliest sell as synthetic buy date (realistic for FIFO)
+        sell_dt = earliest_sell[symbol]
+        buy_date = sell_dt - timedelta(days=1)
+        if buy_date.weekday() >= 5:  # Push to Friday if weekend
+            buy_date -= timedelta(days=(buy_date.weekday() - 4))
+        buy_date = buy_date.replace(hour=12, minute=0, second=0, microsecond=0)
 
         settle = settlement_date_for_trade(
             buy_date.date(), "US" if currency == "USD" else ""
@@ -194,6 +285,83 @@ def _build_supplementary_buys(
         )
 
     return supplementary, warnings
+
+
+def _dedup_transactions(transactions: list[UnifiedTransaction]) -> list[UnifiedTransaction]:
+    """Remove duplicate transactions from overlapping files.
+
+    Three-pass approach:
+    1. Exact ID dedup — removes duplicates when the same trade appears in multiple
+       raw CSV files with the same TransactionID.
+    2. Same-price aggregate dedup — when an Activity Statement aggregates partial
+       fills into one row (e.g. 123 units) and a raw CSV has the individual fills
+       (16 + 7 + 100) at the same price, keep only the individual fills.
+    3. Blended-price aggregate dedup — when an Activity Statement merges partial
+       fills at *different* prices into one row with a blended price (e.g. 17.5 @
+       151.0009 = 0.5 @ 151.03 + 17 @ 151), group by (symbol, datetime, action)
+       without price and keep the granular breakdown.
+    """
+    if not transactions:
+        return transactions
+
+    # Pass 1: exact ID dedup
+    seen_ids: set[str] = set()
+    deduped: list[UnifiedTransaction] = []
+    for tx in transactions:
+        if tx.id not in seen_ids:
+            seen_ids.add(tx.id)
+            deduped.append(tx)
+
+    id_dupes = len(transactions) - len(deduped)
+    if id_dupes:
+        logger.info("Deduplicated %d exact-ID duplicates", id_dupes)
+
+    # Pass 2: same-price aggregate dedup
+    groups: dict[tuple, list[int]] = defaultdict(list)
+    for i, tx in enumerate(deduped):
+        if tx.action in (ActionType.BUY, ActionType.SELL):
+            key = (tx.symbol, tx.trade_date, tx.action, tx.price)
+            groups[key].append(i)
+
+    remove_indices: set[int] = set()
+    for key, indices in groups.items():
+        if len(indices) <= 1:
+            continue
+        quantities = [(i, deduped[i].quantity) for i in indices]
+        quantities.sort(key=lambda x: x[1], reverse=True)
+        largest_i, largest_q = quantities[0]
+        rest_sum = sum(q for _, q in quantities[1:])
+        if rest_sum == largest_q:
+            remove_indices.add(largest_i)
+
+    if remove_indices:
+        logger.info("Removed %d same-price aggregate duplicates", len(remove_indices))
+        deduped = [tx for i, tx in enumerate(deduped) if i not in remove_indices]
+
+    # Pass 3: blended-price aggregate dedup
+    # Group by (symbol, datetime, action) WITHOUT price — catches blended-price aggregates
+    time_groups: dict[tuple, list[int]] = defaultdict(list)
+    for i, tx in enumerate(deduped):
+        if tx.action in (ActionType.BUY, ActionType.SELL):
+            key = (tx.symbol, tx.trade_date, tx.action)
+            time_groups[key].append(i)
+
+    remove_blended: set[int] = set()
+    for key, indices in time_groups.items():
+        if len(indices) <= 1:
+            continue
+        quantities = [(i, deduped[i].quantity) for i in indices]
+        quantities.sort(key=lambda x: x[1], reverse=True)
+        largest_i, largest_q = quantities[0]
+        rest_sum = sum(q for _, q in quantities[1:])
+        if rest_sum == largest_q:
+            remove_blended.add(largest_i)
+
+    if remove_blended:
+        logger.info("Removed %d blended-price aggregate duplicates", len(remove_blended))
+        deduped = [tx for i, tx in enumerate(deduped) if i not in remove_blended]
+
+    return deduped
 
 
 @app.post("/api/calculate")
@@ -320,6 +488,10 @@ async def calculate_tax(
             detail="No valid transactions found in uploaded files",
         )
 
+    # Dedup transactions from overlapping files
+    # (e.g. same IBKR trades exported as both raw CSV and Activity Statement)
+    all_transactions = _dedup_transactions(all_transactions)
+
     # Supplement missing buys from Performance report Trade Summary
     supplementary_warnings = []
     if perf_report:
@@ -357,6 +529,11 @@ async def calculate_tax(
             status_code=500,
             detail=f"Tax calculation error: {str(e)}",
         )
+
+    # Supplement open positions from Performance report
+    # (covers positions bought before the Activity Statement period)
+    if perf_report and perf_report.open_positions:
+        _supplement_open_positions(report, perf_report, nbp_client)
 
     return {
         "files": file_summaries,
@@ -437,4 +614,42 @@ async def portfolio_analysis(
         raise HTTPException(
             status_code=500,
             detail=f"Blad analizy portfela: {str(e)}",
+        )
+
+
+@app.post("/api/ike-ikze")
+async def ike_ikze_upload(
+    file: UploadFile = File(...),
+):
+    """
+    Upload a mBank eMakler IKE/IKZE portfolio snapshot CSV.
+    Returns parsed positions for portfolio analysis display.
+    """
+    try:
+        content = await file.read()
+        filename = file.filename or "unknown"
+
+        parser = IkeIkzeParser()
+        if not parser.detect(content, filename):
+            raise HTTPException(
+                status_code=400,
+                detail="Plik nie wyglada na arkusz IKE/IKZE z mBank eMakler. "
+                       "Oczekiwany format: CSV z sekcjami 'ike' / 'ikze' i pozycjami portfela.",
+            )
+
+        report = parser.parse(content, filename)
+        return {
+            "filename": filename,
+            "report": report.model_dump(mode="json"),
+        }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("IKE/IKZE parse error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Blad parsowania pliku IKE/IKZE: {str(e)}",
         )

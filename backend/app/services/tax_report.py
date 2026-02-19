@@ -19,6 +19,7 @@ from app.models import (
     DividendSummary,
     FifoMatch,
     OpenPosition,
+    ShortPosition,
     TaxReport,
     UnifiedTransaction,
 )
@@ -201,6 +202,27 @@ class TaxReportGenerator:
                     currency=tx.currency,
                     cost_pln=cost,
                     nbp_rate=rate,
+                    broker=tx.broker,
+                ))
+
+        # Step 7b: Open short positions (written options / derivatives)
+        short_pos = []
+        for symbol, lots in fifo_result.open_short_positions.items():
+            for lot in lots:
+                tx = lot.transaction
+                rate = tx.nbp_rate or Decimal("1")
+                revenue = (tx.price * lot.remaining_qty * rate).quantize(
+                    TWO_PLACES, ROUND_HALF_UP
+                )
+                short_pos.append(ShortPosition(
+                    symbol=symbol,
+                    quantity=lot.remaining_qty,
+                    sell_date=tx.trade_date.date(),
+                    sell_price=tx.price,
+                    currency=tx.currency,
+                    revenue_pln=revenue,
+                    nbp_rate=rate,
+                    broker=tx.broker,
                 ))
 
         # Step 8: Portfolio analytics (all years, unfiltered)
@@ -225,6 +247,7 @@ class TaxReportGenerator:
             dividends=dividends,
             pit_zg=pit_zg,
             open_positions=open_pos,
+            open_short_positions=short_pos,
             warnings=warnings,
             portfolio=portfolio,
         )
@@ -335,30 +358,39 @@ class TaxReportGenerator:
     @staticmethod
     def _guess_country_from_symbol(symbol: str) -> str:
         """
-        Heuristic to guess country from symbol suffix.
-        e.g. VWCE.DE -> DE, AAPL (no suffix) -> US
+        Heuristic to guess country from symbol suffix / exchange.
+        Handles IBKR (AMD, VWCE.DE) and Exante (AMD.NASDAQ, QQQ.CBOE.31Z2025.P615).
         """
-        if "." in symbol:
-            suffix = symbol.rsplit(".", 1)[-1].upper()
-            # Common exchange suffixes
-            exchange_to_country = {
-                "DE": "DE",
-                "L": "GB",
-                "AS": "NL",
-                "PA": "FR",
-                "MI": "IT",
-                "MC": "ES",
-                "SW": "CH",
-                "TO": "CA",
-                "AX": "AU",
-                "HK": "HK",
-                "T": "JP",
-                "SS": "SE",
-                "CO": "DK",
-                "HE": "FI",
-                "OL": "NO",
-                "WA": "PL",
-            }
-            return exchange_to_country.get(suffix, suffix)
-        # Default: assume US for plain symbols
+        parts = symbol.split(".")
+
+        exchange_to_country = {
+            # IBKR / Yahoo Finance suffixes
+            "DE": "DE", "L": "GB", "AS": "NL", "PA": "FR",
+            "MI": "IT", "MC": "ES", "SW": "CH", "TO": "CA",
+            "AX": "AU", "HK": "HK", "T": "JP", "SS": "SE",
+            "CO": "DK", "HE": "FI", "OL": "NO", "WA": "PL",
+            # Exante exchange suffixes
+            "NASDAQ": "US", "NYSE": "US", "ARCA": "US", "AMEX": "US",
+            "CBOE": "US", "EURONEXT": "NL", "LSE": "GB", "LSEIOB": "GB",
+            "SIX": "CH", "WSE": "PL",
+        }
+
+        if len(parts) >= 2:
+            # ISIN-like first part (e.g. US912810SP49.USD) → country from ISIN
+            if len(parts[0]) >= 12 and parts[0][:2].isalpha():
+                return parts[0][:2].upper()
+
+            # Second segment is the exchange (AMD.NASDAQ or QQQ.CBOE.31Z2025.P615)
+            exchange = parts[1].upper()
+            if exchange in exchange_to_country:
+                return exchange_to_country[exchange]
+
+            # Fallback: try last segment (IBKR style like VWCE.DE)
+            last = parts[-1].upper()
+            if last in exchange_to_country:
+                return exchange_to_country[last]
+
+            return "XX"
+
+        # Plain symbols (no dot) default to US
         return "US"

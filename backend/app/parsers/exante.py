@@ -17,7 +17,7 @@ The "Custom" report CSV may contain BOTH formats, preceded by a costs/fees
 summary section. This parser handles all cases:
   - Clean format only → parse trades from Format 1
   - Traditional format only → parse trades, dividends, taxes from Format 2
-  - Both formats → trades from Format 1, dividends+taxes from Format 2
+  - Both formats → trades merged from Format 1 + Format 2 (deduped), dividends+taxes from Format 2
 
 All files are UTF-16 encoded (with BOM), tab-delimited, with quoted fields.
 """
@@ -38,10 +38,10 @@ from app.parsers.base import BaseParser
 logger = logging.getLogger(__name__)
 
 
-# Column name mapping: Polish -> canonical English (Format 2 / traditional)
+# Column name mapping: Polish (and English variants) -> canonical English (Format 2 / traditional)
 POLISH_HEADERS = {
+    # Polish headers
     "Identyfikator transakcji": "TransactionID",
-    "Transaction ID": "TransactionID",
     "Identyfikator konta": "AccountID",
     "ID symbolu": "SymbolID",
     "ISIN": "ISIN",
@@ -49,7 +49,6 @@ POLISH_HEADERS = {
     "Gdy": "When",
     "Suma": "Amount",
     "Aktywa": "Asset",
-    "EUR equivalent": "EUREquivalent",
     "Ekwiwalent EUR": "EUREquivalent",
     "Komentarz": "Comment",
     "UUID": "UUID",
@@ -58,6 +57,17 @@ POLISH_HEADERS = {
     "Waluta": "Currency",
     "Nazwa handlowca": "TraderName",
     "Strona": "Side",
+    # English header variants (some Exante accounts export in English)
+    "Transaction ID": "TransactionID",
+    "Account ID": "AccountID",
+    "Symbol ID": "SymbolID",
+    "Operation type": "OperationType",
+    "When": "When",
+    "Sum": "Amount",
+    "Asset": "Asset",
+    "EUR equivalent": "EUREquivalent",
+    "Comment": "Comment",
+    "Parent UUID": "ParentUUID",
 }
 
 # Column name mapping for Format 1 (clean / Custom report)
@@ -89,6 +99,7 @@ TRADE_OPS = {"TRADE"}
 COMMISSION_OPS = {"COMMISSION"}
 DIVIDEND_OPS = {"DIVIDEND", "COUPON PAYMENT"}
 TAX_OPS = {"US TAX", "TAX"}
+CORPORATE_OPS = {"STOCK SPLIT", "CORPORATE ACTION"}
 SKIP_OPS = {"ROLLOVER", "CUSTODY FEE", "INTEREST", "FUNDING/WITHDRAWAL",
             "AUTOCONVERSION", "SUBACCOUNT TRANSFER", "BANK CHARGE"}
 
@@ -192,11 +203,31 @@ def _is_forex_symbol(symbol: str) -> bool:
     return False
 
 
+_EXCHANGE_TO_COUNTRY = {
+    "NASDAQ": "US", "NYSE": "US", "ARCA": "US", "AMEX": "US", "CBOE": "US",
+    "EURONEXT": "NL", "LSE": "GB", "LSEIOB": "GB", "SIX": "CH", "WSE": "PL",
+}
+
+
 def _extract_country_from_comment(comment: str) -> Optional[str]:
     """Extract DivCntry from Exante dividend comment."""
     match = re.search(r"DivCntry\s+(\w{2})", comment)
     if match:
         return match.group(1).upper()
+    return None
+
+
+def _country_from_symbol(symbol: str) -> Optional[str]:
+    """Guess country from Exante symbol exchange suffix (e.g. AMD.NASDAQ → US)."""
+    if not symbol:
+        return None
+    # US Treasury bonds: US912810SP49.USD
+    if symbol.startswith("US") and len(symbol) >= 12 and symbol[:12].replace(".", "").isalnum():
+        return "US"
+    parts = symbol.split(".")
+    for part in parts[1:]:
+        if part in _EXCHANGE_TO_COUNTRY:
+            return _EXCHANGE_TO_COUNTRY[part]
     return None
 
 
@@ -214,8 +245,8 @@ def _is_clean_header(line: str) -> bool:
 def _is_traditional_header(line: str) -> bool:
     """Check if a line is a Format 2 (traditional) header row."""
     fields = [f.strip().strip('"').strip() for f in line.split("\t")]
-    has_op_type = any(f in ("Rodzaj operacji", "OperationType") for f in fields)
-    has_amount = any(f in ("Suma", "Amount", "Kwota") for f in fields)
+    has_op_type = any(f in ("Rodzaj operacji", "OperationType", "Operation type") for f in fields)
+    has_amount = any(f in ("Suma", "Amount", "Kwota", "Sum") for f in fields)
     has_asset = any(f in ("Aktywa", "Asset") for f in fields)
     return has_op_type and has_amount and has_asset
 
@@ -232,8 +263,10 @@ class ExanteParser(BaseParser):
         indicators = [
             "Rodzaj operacji",
             "OperationType",
+            "Operation type",
             "ID symbolu",
             "SymbolID",
+            "Symbol ID",
             "Ekwiwalent EUR",
             "EUR equivalent",
             "XEQ",      # Exante account prefix
@@ -257,51 +290,81 @@ class ExanteParser(BaseParser):
 
         # Scan for section headers (multi-section files have costs + trades + traditional)
         clean_sections = []      # (header_idx, header_fields) for Format 1
-        traditional_idx = None   # line index where Format 2 header starts
+        traditional_sections = []  # header indices for Format 2
 
         for i, line in enumerate(lines):
             if _is_clean_header(line):
                 raw = [f.strip().strip('"').strip() for f in line.split("\t")]
                 clean_sections.append((i, raw))
             elif _is_traditional_header(line):
-                traditional_idx = i
+                traditional_sections.append(i)
 
         # Parse Format 1 (clean trades) if present
         clean_trades: list[UnifiedTransaction] = []
         if clean_sections:
-            clean_trades = self._parse_clean_sections(lines, clean_sections, traditional_idx)
+            first_trad = traditional_sections[0] if traditional_sections else None
+            clean_trades = self._parse_clean_sections(lines, clean_sections, first_trad)
             logger.info("Parsed %d clean-format trades from Exante", len(clean_trades))
 
-        # Parse Format 2 (traditional) if present
+        # Parse Format 2 (traditional) if present — collect from ALL sections
         traditional_rows: list[dict[str, str]] = []
-        if traditional_idx is not None:
-            raw_headers = lines[traditional_idx].split("\t")
+        for sec_i, trad_idx in enumerate(traditional_sections):
+            raw_headers = lines[trad_idx].split("\t")
             headers = _normalize_headers(raw_headers, POLISH_HEADERS)
 
-            for line in lines[traditional_idx + 1:]:
+            # Data goes until the next traditional section header (or end of file)
+            if sec_i + 1 < len(traditional_sections):
+                end_idx = traditional_sections[sec_i + 1]
+            else:
+                end_idx = len(lines)
+
+            for line in lines[trad_idx + 1: end_idx]:
                 values = [v.strip().strip('"').strip() for v in line.split("\t")]
                 if len(values) < len(headers):
                     values.extend([""] * (len(headers) - len(values)))
                 row = dict(zip(headers, values))
                 traditional_rows.append(row)
 
-        # Build transactions with priority logic
+        # Build transactions: merge both formats, deduplicating
         transactions: list[UnifiedTransaction] = []
 
         if clean_trades:
-            # Use Format 1 for trades (better data: actual price, settlement date)
+            # Use Format 1 as base (better data: actual price, settlement date)
             transactions.extend(clean_trades)
+
+            # Supplement with Format 2 trades not present in Format 1
+            if traditional_rows:
+                traditional_trades = self._process_trades(traditional_rows)
+                # Dedup: match by (symbol, action, qty) within a 10-minute window
+                # Format 1 and Format 2 timestamps can differ by several minutes
+                for tx in traditional_trades:
+                    is_dup = False
+                    for clean_tx in clean_trades:
+                        if (clean_tx.symbol == tx.symbol
+                                and clean_tx.action == tx.action
+                                and clean_tx.quantity == tx.quantity):
+                            time_diff = abs((tx.trade_date - clean_tx.trade_date).total_seconds())
+                            if time_diff < 600:  # 10 minutes
+                                is_dup = True
+                                break
+                    if not is_dup:
+                        transactions.append(tx)
+                        logger.info(
+                            "Added Format 2 trade not in Format 1: %s %s %s x %s",
+                            tx.action.value, tx.symbol, tx.quantity, tx.trade_date.date(),
+                        )
         elif traditional_rows:
             # Fallback: use Format 2 for trades
             transactions.extend(self._process_trades(traditional_rows))
 
-        # Always use Format 2 for dividends and taxes (only available there)
+        # Always use Format 2 for dividends, taxes, and corporate actions
         if traditional_rows:
             transactions.extend(self._process_dividends(traditional_rows))
             transactions.extend(self._process_taxes(traditional_rows))
+            transactions.extend(self._process_corporate_actions(traditional_rows))
 
         # If no sections found, try legacy single-header format (old simple files)
-        if not clean_sections and traditional_idx is None and lines:
+        if not clean_sections and not traditional_sections and lines:
             logger.info("No section headers found, trying legacy single-header parse")
             raw_headers = lines[0].split("\t")
             headers = _normalize_headers(raw_headers, POLISH_HEADERS)
@@ -315,9 +378,47 @@ class ExanteParser(BaseParser):
             transactions.extend(self._process_trades(rows))
             transactions.extend(self._process_dividends(rows))
             transactions.extend(self._process_taxes(rows))
+            transactions.extend(self._process_corporate_actions(rows))
 
         transactions.sort(key=lambda t: t.trade_date)
+
+        # Extract account ID to distinguish multiple Exante accounts
+        account_id = self._extract_account_id(text, filename)
+        if account_id:
+            broker_label = f"EXANTE ({account_id})"
+            for tx in transactions:
+                tx.broker = broker_label
+            logger.info("Exante account identified: %s", account_id)
+
         return transactions
+
+    @staticmethod
+    def _extract_account_id(text: str, filename: str) -> Optional[str]:
+        """Extract Exante account ID from filename or file content."""
+        # Try filename first: look for account-like patterns (e.g. FCP0101.001, XEQ1234.001)
+        m = re.search(r"([A-Z]{3}\d{4}\.\d{3})", filename.upper())
+        if m:
+            return m.group(1)
+        m = re.search(r"([A-Z]{3}\d{4})", filename.upper())
+        if m:
+            return m.group(1)
+        # Fallback: scan file content for account ID in "Identyfikator konta" column
+        # Matches patterns like WXS2094.001 or FCP0101.001 (also WXS2094.00000)
+        account_ids = re.findall(r"([A-Z]{3}\d{4}\.\d{3,5})", text.upper())
+        if account_ids:
+            # Return the most common short form (XXX9999.001)
+            from collections import Counter
+            # Normalize: truncate .00000 → .001 style
+            normalized = []
+            for aid in account_ids:
+                base = aid.split(".")[0]
+                suffix = aid.split(".")[1]
+                if len(suffix) > 3:
+                    suffix = "001"  # normalize .00000 → .001
+                normalized.append(f"{base}.{suffix}")
+            most_common = Counter(normalized).most_common(1)[0][0]
+            return most_common
+        return None
 
     def _parse_clean_sections(
         self,
@@ -384,6 +485,20 @@ class ExanteParser(BaseParser):
             price = _safe_decimal(row.get("Price", "0"))
             if price <= 0:
                 return None
+
+            # For bonds (ISIN-based symbols like US912810SP49.USD), Price is
+            # a percentage of par value, not the actual unit price.
+            # Use TradeVolume (actual cash amount) to derive the real price.
+            trade_volume = abs(_safe_decimal(row.get("TradeVolume", "0")))
+            if trade_volume > 0 and qty > 0:
+                real_price = (trade_volume / qty).quantize(Decimal("0.000001"))
+                if abs(real_price - price) / price > Decimal("0.01"):
+                    # Price and TradeVolume/qty differ significantly → bond pricing
+                    logger.info(
+                        "Bond price adjustment for %s: Price=%s -> TradeVolume/Qty=%s",
+                        row.get("SymbolID", "?"), price, real_price,
+                    )
+                    price = real_price
 
             currency = row.get("Currency", "USD").strip()
             if not currency or currency == "None":
@@ -584,6 +699,7 @@ class ExanteParser(BaseParser):
                     broker=BrokerName.EXANTE,
                     symbol=symbol,
                     isin=isin,
+                    country=country or (isin[:2].upper() if isin and len(isin) >= 2 and isin[:2].isalpha() else None) or _country_from_symbol(symbol),
                     description=comment[:200] if comment else None,
                     trade_date=pay_dt,
                     settlement_date=pay_dt.date(),
@@ -631,6 +747,7 @@ class ExanteParser(BaseParser):
                 isin = isin_val if isin_val and isin_val != "None" else None
 
                 comment = row.get("Comment", "")
+                country = _extract_country_from_comment(comment)
 
                 tx_id = row.get("TransactionID", "")
                 row_id = _make_id(f"EX_WHT_{tx_id}_{symbol}")
@@ -640,6 +757,7 @@ class ExanteParser(BaseParser):
                     broker=BrokerName.EXANTE,
                     symbol=symbol,
                     isin=isin,
+                    country=country or (isin[:2].upper() if isin and len(isin) >= 2 and isin[:2].isalpha() else None) or _country_from_symbol(symbol),
                     description=comment[:200] if comment else None,
                     trade_date=pay_dt,
                     settlement_date=pay_dt.date(),
@@ -652,5 +770,78 @@ class ExanteParser(BaseParser):
 
             except Exception as e:
                 logger.warning("Failed to parse Exante tax: %s – %s", row, e)
+
+        return results
+
+    def _process_corporate_actions(self, rows: list[dict[str, str]]) -> list[UnifiedTransaction]:
+        """
+        Process STOCK SPLIT and CORPORATE ACTION (ticker change) rows.
+
+        Stock splits: -10 old shares + +20 new shares (same symbol).
+        Ticker changes: -6 OLD_SYMBOL + +6 NEW_SYMBOL (same ISIN).
+
+        We emit BUY (for +qty) and SELL (for -qty) at price=0, commission=0.
+        This ensures FIFO inventory stays correct across splits and renames.
+        """
+        results: list[UnifiedTransaction] = []
+
+        for row in rows:
+            op = row.get("OperationType", "").strip().upper()
+            if op not in CORPORATE_OPS:
+                continue
+
+            try:
+                symbol = row.get("SymbolID", "").strip()
+                if not symbol or symbol == "None":
+                    continue
+
+                asset = row.get("Asset", "").strip()
+                # Only process asset-line rows (not currency rows)
+                if not _is_asset_symbol(asset):
+                    continue
+
+                when_str = row.get("When", "").strip()
+                action_dt = _parse_exante_datetime(when_str)
+
+                amount = _safe_decimal(row.get("Amount", "0"))
+                if amount == 0:
+                    continue
+
+                isin_val = row.get("ISIN", "").strip()
+                isin = isin_val if isin_val and isin_val != "None" else None
+
+                comment = row.get("Comment", "")
+
+                if amount > 0:
+                    action = ActionType.BUY
+                    qty = amount
+                else:
+                    action = ActionType.SELL
+                    qty = abs(amount)
+
+                tx_id = row.get("TransactionID", "")
+                row_id = _make_id(f"EX_CORP_{tx_id}_{symbol}_{amount}")
+
+                results.append(UnifiedTransaction(
+                    id=row_id,
+                    broker=BrokerName.EXANTE,
+                    symbol=symbol,
+                    isin=isin,
+                    description=f"[{op}] {comment[:180]}" if comment else f"[{op}]",
+                    trade_date=action_dt,
+                    settlement_date=action_dt.date(),
+                    action=action,
+                    quantity=qty,
+                    price=Decimal("0"),
+                    currency="USD",
+                    commission=Decimal("0"),
+                ))
+                logger.info(
+                    "Corporate action: %s %s %s %s qty=%s (%s)",
+                    op, action.value, symbol, action_dt.date(), qty, comment[:60],
+                )
+
+            except Exception as e:
+                logger.warning("Failed to parse corporate action: %s – %s", row, e)
 
         return results

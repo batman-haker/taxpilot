@@ -24,6 +24,30 @@ logger = logging.getLogger(__name__)
 TWO_PLACES = Decimal("0.01")
 
 
+def _is_option_symbol(symbol: str) -> bool:
+    """
+    Detect option/derivative symbols.
+
+    Exante options: TQQQ.CBOE.16F2026.P75, AAPL.NASDAQ.20D2025.C150
+    IBKR options: AAPL 250117C00150000
+    Pattern: last segment starts with P or C followed by digits (strike price).
+    """
+    if not symbol:
+        return False
+    parts = symbol.split(".")
+    if len(parts) >= 4:
+        last = parts[-1]
+        # e.g. P75, C150, P52
+        if len(last) >= 2 and last[0] in ("P", "C") and last[1:].replace(".", "").isdigit():
+            return True
+    # IBKR style: "AAPL 250117C00150000"
+    if " " in symbol and len(symbol) > 10:
+        tail = symbol.split()[-1]
+        if any(c in tail for c in ("C", "P")) and any(c.isdigit() for c in tail):
+            return True
+    return False
+
+
 @dataclass
 class BuyLot:
     """A lot of shares available for matching against future sells."""
@@ -45,6 +69,8 @@ class FifoResult:
     warnings: list[str] = field(default_factory=list)
     # Remaining open buy positions (not yet sold)
     open_positions: dict[str, list[BuyLot]] = field(default_factory=dict)
+    # Open short positions (sells with no matching buy — options/derivatives)
+    open_short_positions: dict[str, list[ShortLot]] = field(default_factory=dict)
 
 
 class FifoEngine:
@@ -144,23 +170,35 @@ class FifoEngine:
                         ShortLot(transaction=tx, remaining_qty=sell_remaining)
                     )
 
-        # After all transactions: remaining short positions are true orphans
+        # After all transactions: remaining short positions
         for symbol, queue in short_queues.items():
             for lot in queue:
                 if lot.remaining_qty > 0:
-                    orphan_match = self._create_orphan_match(
-                        symbol=symbol,
-                        quantity=lot.remaining_qty,
-                        sell_tx=lot.transaction,
-                        sell_total_qty=lot.transaction.quantity,
-                    )
-                    result.matches.append(orphan_match)
-                    result.warnings.append(
-                        f"BRAK KUPNA: Nie znaleziono zakupu dla {symbol} "
-                        f"(sprzedaz {lot.remaining_qty} szt. dnia {lot.transaction.trade_date.date()}). "
-                        f"Uwzgledniono z kosztem 0 PLN — wgraj pliki z wczesniejszych lat "
-                        f"lub dodaj brakujace kupno recznie."
-                    )
+                    if _is_option_symbol(symbol):
+                        # Options/derivatives: open short position (not taxable until closed)
+                        if symbol not in result.open_short_positions:
+                            result.open_short_positions[symbol] = []
+                        result.open_short_positions[symbol].append(lot)
+                        result.warnings.append(
+                            f"OTWARTA KROTKA POZYCJA: {symbol} "
+                            f"({lot.remaining_qty} szt. sprzedane dnia {lot.transaction.trade_date.date()}). "
+                            f"Opcja/derywat — pozycja otwarta, nie podlega opodatkowaniu do momentu zamkniecia."
+                        )
+                    else:
+                        # Regular stocks: orphan sell (taxed with 0 cost as fallback)
+                        orphan_match = self._create_orphan_match(
+                            symbol=symbol,
+                            quantity=lot.remaining_qty,
+                            sell_tx=lot.transaction,
+                            sell_total_qty=lot.transaction.quantity,
+                        )
+                        result.matches.append(orphan_match)
+                        result.warnings.append(
+                            f"BRAK KUPNA: Nie znaleziono zakupu dla {symbol} "
+                            f"(sprzedaz {lot.remaining_qty} szt. dnia {lot.transaction.trade_date.date()}). "
+                            f"Uwzgledniono z kosztem 0 PLN — wgraj pliki z wczesniejszych lat "
+                            f"lub dodaj brakujace kupno recznie."
+                        )
 
         # Collect open positions (remaining unmatched buys)
         for symbol, queue in buy_queues.items():
@@ -213,6 +251,7 @@ class FifoEngine:
             sell_revenue_pln=sell_revenue_pln,
             profit_pln=sell_revenue_pln,        # profit = revenue - 0
             is_orphan=True,
+            broker=sell_tx.broker,
         )
 
     def _create_match(
@@ -272,4 +311,5 @@ class FifoEngine:
             sell_nbp_rate=sell_rate,
             sell_revenue_pln=sell_revenue_pln,
             profit_pln=profit,
+            broker=sell_tx.broker,
         )

@@ -41,9 +41,10 @@ class UnifiedTransaction(BaseModel):
     """Every broker file is normalised into this schema before calculations."""
 
     id: str = Field(description="Unique identifier (UUID or row hash)")
-    broker: BrokerName
+    broker: str = Field(description="Broker label, e.g. IBKR, EXANTE, EXANTE (FCP0101)")
     symbol: str = Field(description="Ticker symbol, e.g. AAPL, VWCE.DE")
     isin: Optional[str] = Field(default=None, description="ISIN code for country identification")
+    country: Optional[str] = Field(default=None, description="ISO 2-letter country code (from ISIN, broker data, or comment)")
     description: Optional[str] = Field(default=None, description="Instrument description from broker")
 
     trade_date: datetime = Field(description="Date/time the trade was executed")
@@ -95,6 +96,7 @@ class FifoMatch(BaseModel):
     profit_pln: Decimal            # sell_revenue_pln - buy_cost_pln
     is_orphan: bool = False        # True if sell had no matching buy (cost=0)
     is_short: bool = False         # True if short sell (sell before buy)
+    broker: Optional[str] = None   # Broker name (IBKR, EXANTE, MANUAL, etc.)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +122,7 @@ class DividendResult(BaseModel):
 
     polish_tax_due: Decimal        # 19% of gross_amount_pln
     tax_to_pay_poland: Decimal     # max(0, polish_tax_due - wht_amount_pln)
+    broker: Optional[str] = None   # Broker name
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,19 @@ class OpenPosition(BaseModel):
     currency: str
     cost_pln: Decimal              # buy_price * qty * nbp_rate
     nbp_rate: Decimal
+    broker: Optional[str] = None   # Broker name (IBKR, EXANTE, MANUAL, etc.)
+
+
+class ShortPosition(BaseModel):
+    """An open short position (e.g. written option not yet closed/expired)."""
+    symbol: str
+    quantity: Decimal
+    sell_date: date
+    sell_price: Decimal
+    currency: str
+    revenue_pln: Decimal           # sell_price * qty * nbp_rate
+    nbp_rate: Decimal
+    broker: Optional[str] = None
 
 
 class TaxReport(BaseModel):
@@ -171,6 +187,7 @@ class TaxReport(BaseModel):
     dividends: DividendSummary
     pit_zg: list[CountryBreakdown] = []
     open_positions: list["OpenPosition"] = []
+    open_short_positions: list["ShortPosition"] = []
     warnings: list[str] = []       # Missing buy records, unrecognised rows, etc.
     portfolio: Optional["PortfolioReport"] = None  # Lifetime portfolio analytics
 
