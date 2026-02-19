@@ -636,7 +636,7 @@ export default function HomePage() {
     }
 
     try {
-      const response = await fetch("http://localhost:8000/api/calculate", {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? ""}/api/calculate`, {
         method: "POST",
         body: formData,
       });
@@ -679,7 +679,7 @@ export default function HomePage() {
     formData.append("file", files[0]);
 
     try {
-      const response = await fetch("http://localhost:8000/api/portfolio-analysis", {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? ""}/api/portfolio-analysis`, {
         method: "POST",
         body: formData,
       });
@@ -712,7 +712,7 @@ export default function HomePage() {
     formData.append("file", ikeFiles[0]);
 
     try {
-      const response = await fetch("http://localhost:8000/api/ike-ikze", {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? ""}/api/ike-ikze`, {
         method: "POST",
         body: formData,
       });
