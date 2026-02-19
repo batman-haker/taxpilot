@@ -13,7 +13,6 @@ env/
 # Node
 node_modules/
 .next/
-out/
 
 # IDE
 .vscode/
